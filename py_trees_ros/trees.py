@@ -74,11 +74,13 @@ class SnapshotStream(object):
             self,
             blackboard_data: bool=False,
             blackboard_activity: bool=False,
-            snapshot_period: float=py_trees.common.Duration.INFINITE
+            snapshot_period: float=py_trees.common.Duration.INFINITE,
+            min_blackbox_level: py_trees.common.BlackBoxLevel=py_trees.common.BlackBoxLevel.DETAIL,
         ):
             self.blackboard_data = blackboard_data
             self.blackboard_activity = blackboard_activity
             self.snapshot_period = py_trees.common.Duration.INFINITE.value if snapshot_period == py_trees.common.Duration.INFINITE else snapshot_period
+            self.min_blackbox_level = min_blackbox_level
 
     def __init__(
         self,
@@ -149,7 +151,7 @@ class SnapshotStream(object):
             changed: bool,
             statistics: py_trees_msgs.Statistics,
             visited_behaviour_ids: typing.Set[uuid.UUID],
-            visited_blackboard_client_ids: typing.Set[uuid.UUID]
+            visited_blackboard_client_ids: typing.Set[uuid.UUID],
     ):
         """"
         Publish a snapshot, including only what has been parameterised.
@@ -173,9 +175,15 @@ class SnapshotStream(object):
         tree_message = py_trees_msgs.BehaviourTree()
         tree_message.changed = changed
 
-        # tree
-        for behaviour in root.iterate():
+        # Iterate over tree, skipping children of behaviors whose level doesn't meet the threshold
+        for behaviour in iterate_to_blackbox_level(root, min_blackbox_level=self.parameters.min_blackbox_level):
             msg = conversions.behaviour_to_msg(behaviour)
+            # For those behaviors that don't meet the threshold (but their parents do)
+            # omit their children from their message
+            if behaviour.blackbox_level < self.parameters.min_blackbox_level:
+                msg.child_ids = []
+                msg.tip_id.uuid[:] = 0
+
             msg.is_active = True if behaviour.id in visited_behaviour_ids else False
             tree_message.behaviours.append(msg)
 
@@ -279,6 +287,7 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
             node_name: str="tree",
             timeout: float=py_trees.common.Duration.INFINITE,
             visitor: typing.Optional[py_trees.visitors.VisitorBase]=None,
+            min_blackbox_level: py_trees.common.BlackBoxLevel=py_trees.common.BlackBoxLevel.DETAIL,
             **kwargs: int
     ):
         """
@@ -290,6 +299,7 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
             node_name: Name of ROS node created. Only takes effect if `node` is None.
             timeout: time (s) to wait (use common.Duration.INFINITE to block indefinitely)
             visitor: runnable entities on each node after it's setup
+            min_blackbox_level: the lowest blackbox level to keep in published trees
             **kwargs: distribute args to this behaviour and in turn, to it's children
 
         .. note:
@@ -407,6 +417,25 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
         )
 
         ########################################
+        # default_snapshot_blackbox_level
+        ########################################
+        self.node.declare_parameter(
+            name='default_snapshot_blackbox_level',
+            value=min_blackbox_level,
+            descriptor=rcl_interfaces_msgs.ParameterDescriptor(
+                name="default_snapshot_blackbox_level",
+                type=rcl_interfaces_msgs.ParameterType.PARAMETER_INTEGER,  # noqa
+                description="minimum blackbox_level children must have to be included in published trees",
+                additional_constraints="",
+                read_only=False,
+                integer_range=[rcl_interfaces_msgs.IntegerRange(
+                    from_value=py_trees.common.BlackBoxLevel.DETAIL,
+                    to_value=py_trees.common.BlackBoxLevel.NOT_A_BLACKBOX,
+                    )],
+            )
+        )
+
+        ########################################
         # setup_timeout
         ########################################
         self.node.declare_parameter(
@@ -482,8 +511,11 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
                         parameters = SnapshotStream.Parameters(
                             snapshot_period=self.node.get_parameter("default_snapshot_period").value,
                             blackboard_data=self.node.get_parameter("default_snapshot_blackboard_data").value,
-                            blackboard_activity=self.node.get_parameter("default_snapshot_blackboard_activity").value
+                            blackboard_activity=self.node.get_parameter("default_snapshot_blackboard_activity").value,
+                            min_blackbox_level=self.node.get_parameter("default_snapshot_blackbox_level").value
                         )
+                        val = self.node.get_parameter("default_snapshot_blackbox_level").value
+                        self.node.get_logger().warn("Min bb level retrieved: {val}")
                     except rclpy.exceptions.ParameterNotDeclaredException:
                         parameters = SnapshotStream.Parameters()
                     self.snapshot_streams[self.default_snapshot_stream_topic_name] = SnapshotStream(
@@ -504,6 +536,9 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
                         else:
                             self.blackboard_exchange.unregister_activity_stream_client()
                     self.snapshot_streams[self.default_snapshot_stream_topic_name].parameters.blackboard_activity = parameter.value
+            elif parameter.name == "default_snapshot_blackbox_level":
+                if self.default_snapshot_stream_topic_name in self.snapshot_streams:
+                    self.snapshot_streams[self.default_snapshot_stream_topic_name].parameters.min_blackbox_level = parameter.value
             elif parameter.name == "default_snapshot_period":
                 if self.default_snapshot_stream_topic_name in self.snapshot_streams:
                     self.snapshot_streams[self.default_snapshot_stream_topic_name].parameters.snapshot_period = parameter.value
@@ -593,7 +628,7 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
                     changed=True,
                     statistics=self.statistics,
                     visited_behaviour_ids=self.snapshot_visitor.visited.keys(),
-                    visited_blackboard_client_ids=self.snapshot_visitor.visited_blackboard_client_ids
+                    visited_blackboard_client_ids=self.snapshot_visitor.visited_blackboard_client_ids,
                 )
 
     def _statistics_pre_tick_handler(self, tree: py_trees.trees.BehaviourTree):
@@ -673,7 +708,7 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
                 changed=self.snapshot_visitor.changed,
                 statistics=self.statistics,
                 visited_behaviour_ids=self.snapshot_visitor.visited.keys(),
-                visited_blackboard_client_ids=self.snapshot_visitor.visited_blackboard_client_ids
+                visited_blackboard_client_ids=self.snapshot_visitor.visited_blackboard_client_ids,
             )
 
         # every tick publish on watchers, clear activity stream (note: not expensive as watchers by default aren't connected)
@@ -701,13 +736,22 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
         request: py_trees_srvs.OpenSnapshotStream.Request,  # noqa
         response: py_trees_srvs.OpenSnapshotStream.Response  # noqa
     ) -> py_trees_srvs.OpenSnapshotStream.Response:
+
+        min_blackbox_level: py_trees.common.BlackBoxLevel
+        if hasattr(request, "min_blackbox_level"):
+            # At time of the addition of this feature to py_trees_ros,
+            # it is not yet implemented in py_trees_ros_interfaces
+            min_blackbox_level = request.parameters.min_blackbox_level
+        else:
+            min_blackbox_level = self.node.get_parameter("default_snapshot_blackbox_level").value
         snapshot_stream = SnapshotStream(
             node=self.node,
             topic_name=request.topic_name,
             parameters=SnapshotStream.Parameters(
                 blackboard_data=request.parameters.blackboard_data,
                 blackboard_activity=request.parameters.blackboard_activity,
-                snapshot_period=request.parameters.snapshot_period
+                snapshot_period=request.parameters.snapshot_period,
+                min_blackbox_level=min_blackbox_level,
             )
         )
         if snapshot_stream.parameters.blackboard_activity:
@@ -1094,3 +1138,29 @@ class Watcher(object):
                 except KeyboardInterrupt:
                     pass
             self.done = True
+
+
+##############################################################################
+# Helpers
+##############################################################################
+
+
+def iterate_to_blackbox_level(
+        root: py_trees.behaviour.Behaviour,
+        min_blackbox_level: py_trees.common.BlackBoxLevel,
+        ) -> typing.Iterator[py_trees.behaviour.Behaviour]:
+    """
+    Iterate through a tree as in Behaviour.iterate() but skip the children of nodes
+    whose blackbox level is lower than a specified minimum level.
+    """
+    for child in root.children:
+        if child.blackbox_level < min_blackbox_level:
+            # The child's blackbox level doesn't meet our threshold, so we don't expand the child node.
+            # However, we still include the child node itself.
+            yield child
+        else:
+            # Expand the child node (if applicable)
+            for node in iterate_to_blackbox_level(child, min_blackbox_level=min_blackbox_level):
+                yield node
+    yield root
+
