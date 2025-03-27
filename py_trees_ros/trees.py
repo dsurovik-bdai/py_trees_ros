@@ -514,8 +514,6 @@ class BehaviourTree(py_trees.trees.BehaviourTree):
                             blackboard_activity=self.node.get_parameter("default_snapshot_blackboard_activity").value,
                             min_blackbox_level=self.node.get_parameter("default_snapshot_blackbox_level").value
                         )
-                        val = self.node.get_parameter("default_snapshot_blackbox_level").value
-                        self.node.get_logger().warn("Min bb level retrieved: {val}")
                     except rclpy.exceptions.ParameterNotDeclaredException:
                         parameters = SnapshotStream.Parameters()
                     self.snapshot_streams[self.default_snapshot_stream_topic_name] = SnapshotStream(
